@@ -57,3 +57,4 @@ build-iPhoneSimulator/
 
 # compiled binary
 /db
+/*.db
