@@ -4,11 +4,23 @@
 #include <string.h>
 #include <stdint.h>
 
+#define TABLE_MAX_PAGES 100
+#define COLUMN_USERNAME_SIZE 32
+#define COLUMN_EMAIL_SIZE 255
+#define size_of_attribute(Struct, Attribute) sizeof(((Struct*)0)->Attribute)
+
 typedef struct {
   char* buffer;
   size_t buffer_length;
   ssize_t input_length;
 } InputBuffer;
+
+typedef struct {
+  uint32_t num_rows;
+  void* pages[TABLE_MAX_PAGES];
+} Table;
+
+typedef enum { EXECUTE_SUCCESS, EXECUTE_TABLE_FULL } ExecuteResult;
 
 InputBuffer* new_input_buffer() {
   InputBuffer* input_buffer = (InputBuffer*)malloc(sizeof(InputBuffer));
@@ -42,6 +54,13 @@ void close_input_buffer(InputBuffer* input_buffer) {
   free(input_buffer);
 }
 
+void free_table(Table* table) {
+  for (int i = 0; table->pages[i]; i++) {
+    free(table->pages[i]);
+  }
+  free(table);
+}
+
 typedef enum {
   META_COMMAND_SUCCESS,
   META_COMMAND_UNRECOGNIZED_COMMAND
@@ -50,6 +69,8 @@ typedef enum {
 typedef enum {
   PREPARE_SUCCESS,
   PREPARE_SYNTAX_ERROR,
+  PREPARE_STRING_TOO_LONG,
+  PREPARE_NEGATIVE_ID,
   PREPARE_UNRECOGNIZED_STATEMENT,
 } PrepareResult;
 
@@ -65,12 +86,10 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table *table) {
   }
 }
 
-#define COLUMN_USERNAME_SIZE 32
-#define COLUMN_EMAIL_SIZE 255
 typedef struct {
   uint32_t id;
-  char username[COLUMN_USERNAME_SIZE];
-  char email[COLUMN_EMAIL_SIZE];
+  char username[COLUMN_USERNAME_SIZE + 1];
+  char email[COLUMN_EMAIL_SIZE + 1];
 } Row;
 
 typedef struct {
@@ -78,7 +97,6 @@ typedef struct {
   Row row_to_insert; // only used by insert statement
 } Statement;
 
-#define size_of_attribute(Struct, Attribute) sizeof(((Struct*)0)->Attribute)
 
 const uint32_t ID_SIZE = size_of_attribute(Row, id);
 const uint32_t USERNAME_SIZE = size_of_attribute(Row, username);
@@ -101,17 +119,11 @@ void deserialize_row(void *source, Row* destination) {
 }
 
 const uint32_t PAGE_SIZE = 4096;
-#define TABLE_MAX_PAGES 100
 const uint32_t ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
 const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 
-typedef struct {
-  uint32_t num_rows;
-  void* pages[TABLE_MAX_PAGES];
-} Table;
-
 void print_row(Row* row) {
-  printf("(%d, %s, %s)\n", row->id, row->username, row->email)
+  printf("(%d, %s, %s)\n", row->id, row->username, row->email);
 }
 
 void* row_slot(Table* table, uint32_t row_num) {
@@ -126,17 +138,43 @@ void* row_slot(Table* table, uint32_t row_num) {
   return page + byte_offset;
 }
 
+PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement) {
+  statement->type = STATEMENT_INSERT;
+
+  char* keyword = strtok(input_buffer->buffer, " ");
+  char* id_string = strtok(NULL, " ");
+  char* username = strtok(NULL, " ");
+  char* email = strtok(NULL, " ");
+
+  if (id_string == NULL || username == NULL || email == NULL) {
+    return PREPARE_SYNTAX_ERROR;
+  }
+
+  int id = atoi(id_string);
+
+  if (id <= 0) {
+    return PREPARE_NEGATIVE_ID;
+  }
+
+  if (strlen(username) > COLUMN_USERNAME_SIZE) {
+    return PREPARE_STRING_TOO_LONG;
+  }
+
+  if (strlen(email) > COLUMN_EMAIL_SIZE) {
+    return PREPARE_STRING_TOO_LONG;
+  }
+
+  statement->row_to_insert.id = id;
+  strcpy(statement->row_to_insert.username, username);
+  strcpy(statement->row_to_insert.email, email);
+
+  return PREPARE_SUCCESS;
+}
+
 PrepareResult prepare_statement(InputBuffer* input_buffer,
                                 Statement* statement) {
   if (strncmp(input_buffer->buffer, "insert", 6) == 0) {
-    statement->type = STATEMENT_INSERT;
-    int args_assigned = sscanf(
-        input_buffer->buffer, "insert %d %s %s", &(statement->row_to_insert.id),
-        statement->row_to_insert.username, statement->row_to_insert.email);
-    if (args_assigned < 3) {
-      return PREPARE_SYNTAX_ERROR;
-    }
-    return PREPARE_SUCCESS;
+    return prepare_insert(input_buffer, statement);
   }
   if (strcmp(input_buffer->buffer, "select") == 0) {
     statement->type = STATEMENT_SELECT;
@@ -153,7 +191,7 @@ ExecuteResult execute_insert(Statement* statement, Table* table) {
 
   Row* row_to_insert = &(statement->row_to_insert);
 
-  serialize_row(row_to_insert, row_slow(table, table->num_rows));
+  serialize_row(row_to_insert, row_slot(table, table->num_rows));
   table->num_rows += 1;
 
   return EXECUTE_SUCCESS;
@@ -186,12 +224,7 @@ Table* new_table() {
   return table;
 }
 
-void free_table(Table* table) {
-  for (int i = 0; table->pages[i]; i++) {
-    free(table->pages[i]);
-  }
-  free(table);
-}
+
 
 int main(int argc, char* arvc[]) {
   Table* table = new_table();
@@ -200,38 +233,42 @@ int main(int argc, char* arvc[]) {
     print_prompt();
     read_input(input_buffer);
 
-    if (strcmp(input_buffer->buffer, ".exit") == 0) {
-      if (input_buffer->buffer[0] == '.') {
-        switch (do_meta_command(input_buffer)) {
-        case (META_COMMAND_SUCCESS):
-          continue;
-        case (META_COMMAND_UNRECOGNIZED_COMMAND):
-          printf("Unrecognized command '%s'\n", input_buffer->buffer);
-          continue;
-        }
-      }
-
-      Statement statement;
-      switch (prepare_statement(input_buffer, &statement)) {
-      case (PREPARE_SUCCESS):
-        break;
-      case (PREPARE_SYNTAX_ERROR):
-        printf("Syntax error. Could not parse statement.\n");
+    if (input_buffer->buffer[0] == '.') {
+      switch (do_meta_command(input_buffer, table)) {
+      case (META_COMMAND_SUCCESS):
         continue;
-      case (PREPARE_UNRECOGNIZED_STATEMENT):
-        printf("Unrecognized keyword at start of '%s'.\n",
-               input_buffer->buffer);
+      case (META_COMMAND_UNRECOGNIZED_COMMAND):
+        printf("Unrecognized command '%s'\n", input_buffer->buffer);
         continue;
       }
+    }
 
-      switch (execute_statement(&statement, table)) {
-      case (EXECUTE_SUCCESS):
-        printf("Executed.\n");
-        break;
-      case (EXECUTE_TABLE_FULL):
-        printf("Error: Table full.\n");
-        break;
-      }
+    Statement statement;
+    switch (prepare_statement(input_buffer, &statement)) {
+    case (PREPARE_SUCCESS):
+      break;
+    case (PREPARE_STRING_TOO_LONG):
+      printf("String is too long.\n");
+      continue;
+    case (PREPARE_NEGATIVE_ID):
+      printf("ID must be positive.\n");
+      continue;
+    case (PREPARE_SYNTAX_ERROR):
+      printf("Syntax error. Could not parse statement.\n");
+      continue;
+    case (PREPARE_UNRECOGNIZED_STATEMENT):
+      printf("Unrecognized keyword at start of '%s'.\n",
+             input_buffer->buffer);
+      continue;
+    }
+
+    switch (execute_statement(&statement, table)) {
+    case (EXECUTE_SUCCESS):
+      printf("Executed.\n");
+      break;
+    case (EXECUTE_TABLE_FULL):
+      printf("Error: Table full.\n");
+      break;
     }
   }
 }
