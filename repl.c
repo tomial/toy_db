@@ -43,8 +43,8 @@ typedef enum { NODE_INTERNAL, NODE_LEAF } NodeType;
 
 void* get_page(Pager* pager, uint32_t page_num);
 void db_close(Table* table);
-
-
+void print_constants(void);
+void print_leaf_node(void* node);
 
 InputBuffer* new_input_buffer() {
   InputBuffer* input_buffer = (InputBuffer*)malloc(sizeof(InputBuffer));
@@ -97,6 +97,14 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table *table) {
   if (strcmp(input_buffer->buffer, ".exit") == 0) {
     db_close(table);
     exit(EXIT_SUCCESS);
+  } else if (strcmp(input_buffer->buffer, ".constants") == 0) {
+    printf("Constants:\n");
+    print_constants();
+    return META_COMMAND_SUCCESS;
+  } else if (strcmp(input_buffer->buffer, ".btree") == 0) {
+    printf("Tree:\n");
+    print_leaf_node(get_page(table->pager, 0));
+    return META_COMMAND_SUCCESS;
   } else {
     return META_COMMAND_UNRECOGNIZED_COMMAND;
   }
@@ -183,6 +191,46 @@ void deserialize_row(void *source, Row* destination) {
   memcpy(&(destination->email), source + EMAIL_OFFSET, EMAIL_SIZE);
 }
 
+void print_constants() {
+  printf("ROW_SIZE: %d\n", ROW_SIZE);
+  printf("COMMON_NODE_HEADER_SIZE: %d\n", COMMON_NODE_HEADER_SIZE);
+  printf("LEAF_NODE_HEADER_SIZE: %d\n", LEAF_NODE_HEADER_SIZE);
+  printf("LEAF_NODE_CELL_SIZE: %d\n", LEAF_NODE_CELL_SIZE);
+  printf("LEAF_NODE_SPACE_FOR_CELLS: %d\n", LEAF_NODE_SPACE_FOR_CELLS);
+  printf("LEAF_NODE_MAX_CELLS: %d\n", LEAF_NODE_MAX_CELLS);
+}
+
+void print_leaf_node(void* node) {
+  uint32_t num_cells = *leaf_node_num_cells(node);
+  printf("leaf (size %d)\n", num_cells);
+  for (uint32_t i = 0; i < num_cells; i++) {
+    uint32_t key = *leaf_node_key(node, i);
+    printf("  - %d : %d\n", i, key);
+  }
+}
+
+void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value) {
+  void* node = get_page(cursor->table->pager, cursor->page_num);
+
+  uint32_t num_cells = *leaf_node_num_cells(node);
+  if (num_cells >= LEAF_NODE_MAX_CELLS) {
+    // Node full
+    printf("Need to implement splitting a leaf node.");
+    exit(EXIT_FAILURE);
+  }
+
+  if (cursor->cell_num < num_cells) {
+    //Make room for new cell
+    for (uint32_t i = num_cells; i > cursor->cell_num; i--) {
+      memcpy(leaf_node_cell(node, i), leaf_node_cell(node, i - 1), LEAF_NODE_CELL_SIZE);
+    }
+  }
+
+  *(leaf_node_num_cells(node)) += 1;
+  *(leaf_node_key(node, cursor->cell_num)) = key;
+  serialize_row(value, leaf_node_value(node, cursor->cell_num));
+}
+
 void print_row(Row* row) {
   printf("(%d, %s, %s)\n", row->id, row->username, row->email);
 }
@@ -202,16 +250,20 @@ void* get_page(Pager* pager, uint32_t page_num) {
 
   if (pager->pages[page_num] == NULL) {
     // Cache miss. Allocate memory and load from file.
+    // 未加载到内存中，申请内存并从文件加载该页内容
     void* page = malloc(PAGE_SIZE);
     uint32_t num_pages = pager->file_length / PAGE_SIZE;
 
     // We might save a partial page at the end of the file
+    // 最后一页可能是不完整页
     if (pager->file_length % PAGE_SIZE) {
       num_pages += 1;
     }
 
     if (page_num <= num_pages) {
+      // 跳到该页所在地址
       lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
+      // 将文件中的数据读到内存中
       ssize_t bytes_read = read(pager->file_descriptor, page, PAGE_SIZE);
       if (bytes_read == -1) {
         printf("Error reading file: %d\n", errno);
@@ -219,13 +271,16 @@ void* get_page(Pager* pager, uint32_t page_num) {
       }
     }
 
+    // 将该页地址与页号关联
     pager->pages[page_num] = page;
 
+    // 如果页数不足则增加页数
     if (page_num >= pager->num_pages) {
       pager->num_pages = page_num + 1;
     }
   }
 
+  // 返回指向该页的指针
   return pager->pages[page_num];
 }
 
@@ -312,15 +367,15 @@ PrepareResult prepare_statement(InputBuffer* input_buffer,
 }
 
 ExecuteResult execute_insert(Statement* statement, Table* table) {
-  if (table->num_rows >= TABLE_MAX_ROWS) {
+  void* node = get_page(table->pager, table->root_page_num);
+  if ((*leaf_node_num_cells(node) >= LEAF_NODE_MAX_CELLS)) {
     return EXECUTE_TABLE_FULL;
   }
 
   Row* row_to_insert = &(statement->row_to_insert);
   Cursor* cursor = table_end(table);
 
-  serialize_row(row_to_insert, cursor_value(cursor));
-  table->num_rows += 1;
+  leaf_node_insert(cursor, row_to_insert->id, row_to_insert);
 
   free(cursor);
 
@@ -382,12 +437,14 @@ Pager* pager_open(const char* filename) {
   return pager;
 }
 
+// 将数据持久化到磁盘中
 void pager_flush(Pager* pager, uint32_t page_num) {
   if (pager->pages[page_num] == NULL) {
     printf("Tried to flush null page\n");
     exit(EXIT_FAILURE);
   }
 
+  // 移动到该页起始地址
   off_t offset = lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
 
   if (offset == -1) {
@@ -395,6 +452,7 @@ void pager_flush(Pager* pager, uint32_t page_num) {
     exit(EXIT_FAILURE);
   }
 
+  // 将该页写入到磁盘中
   ssize_t bytes_written =
     write(pager->file_descriptor, pager->pages[page_num], PAGE_SIZE);
 
@@ -406,33 +464,41 @@ void pager_flush(Pager* pager, uint32_t page_num) {
 
 Table* db_open(const char* filename) {
   Pager* pager = pager_open(filename);
-  uint32_t num_rows = pager->file_length / ROW_SIZE;
 
   Table* table = malloc(sizeof(Table));
   table->pager = pager;
-  table->num_rows = num_rows;
+  table->root_page_num = 0;
+
+  // 如果数据库为空则初始化root
+  if (pager->num_pages == 0) {
+    // No database file initialize page 0 as leaf page
+    void* root_node = get_page(pager, 0);
+    initialize_leaf_node(root_node);
+  }
 
   return table;
 }
 
 void db_close(Table* table) {
   Pager* pager = table->pager;
-  uint32_t num_full_pages = table->num_rows / ROWS_PER_PAGE;
 
-  for (uint32_t i = 0; i < num_full_pages; i++) {
+  for (uint32_t i = 0; i < pager->num_pages; i++) {
     if (pager->pages[i] == NULL) {
       continue;
     }
-    pager_flush(pager, i);
-    free(pager->pages[i]);
+    pager_flush(pager, i); // 保存到磁盘中
+    free(pager->pages[i]); // free cache
     pager->pages[i] = NULL;
   }
 
+  // 关闭文件
   int result = close(pager->file_descriptor);
   if (result == 1) {
     printf("Error closing db file.\n");
     exit(EXIT_FAILURE);
   }
+
+  // TODO
   for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
     void* page = pager->pages[i];
     if (page) {
@@ -440,6 +506,8 @@ void db_close(Table* table) {
       pager->pages[i] = NULL;
     }
   }
+
+  // 清理pager和table
   free(pager);
   free(table);
 }
