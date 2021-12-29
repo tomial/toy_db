@@ -55,6 +55,7 @@ uint32_t* internal_node_child(void* node, uint32_t child_num);
 uint32_t* internal_node_key(void* node, uint32_t key_num);
 uint32_t* internal_node_right_child(void* node);
 void print_tree(Pager* pager, uint32_t page_num, uint32_t indent_level);
+Cursor* internal_node_find(Table* table, uint32_t page_num, uint32_t key);
 
 InputBuffer* new_input_buffer() {
   InputBuffer* input_buffer = (InputBuffer*)malloc(sizeof(InputBuffer));
@@ -401,6 +402,33 @@ void create_new_root(Table* table, uint32_t right_child_page_num) {
     *internal_node_right_child(root) = right_child_page_num;
 }
 
+Cursor* internal_node_find(Table* table, uint32_t page_num, uint32_t key) {
+    void* node = get_page(table->pager, page_num);
+    uint32_t num_keys = *internal_node_num_keys(node);
+
+    uint32_t min_index = 0;
+    uint32_t max_index = num_keys;
+
+    while (min_index != max_index) {
+        uint32_t index = (min_index + max_index) / 2;
+        uint32_t key_to_right = *internal_node_key(node, index);
+        if (key_to_right >= key) {
+            max_index = index;
+        } else {
+            min_index = index + 1;
+        }
+    }
+
+    uint32_t child_num = *internal_node_child(node, min_index);
+    void* child = get_page(table->pager, child_num);
+    switch (get_node_type(child)) {
+        case NODE_LEAF:
+            return leaf_node_find(table, child_num, key);
+        case NODE_INTERNAL:
+            return internal_node_find(table, child_num, key);
+    }
+}
+
 void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value) {
     /*
      * Create the new node and move half the cells over.
@@ -446,8 +474,7 @@ void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value) {
     if (is_root_node(old_node)) {
         return create_new_root(cursor->table, new_page_num);
     } else {
-        printf("Need to implement updating parent after split");
-        exit(EXIT_FAILURE);
+        return internal_node_find(table, root_page_num, key);
     }
 }
 
